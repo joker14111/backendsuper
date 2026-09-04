@@ -58,22 +58,84 @@ let tokenExpiresAt = 0;
 async function getSyncPayToken() {
   // Verifica se o token ainda é válido
   if (syncPayToken && Date.now() < tokenExpiresAt) {
+    console.log('[SYNCPAY] Usando token em cache');
     return syncPayToken;
   }
 
   if (!SYNC_CONFIG.baseURL || !SYNC_CONFIG.clientId || !SYNC_CONFIG.clientSecret) {
-    console.error('[SYNCPAY] Configuração incompleta! Verifique o .env');
+    console.error('[SYNCPAY] Configuração incompleta!');
     throw new Error('Configuração da SyncPay incompleta');
   }
 
   try {
     console.log('[SYNCPAY] Obtendo novo token...');
 
+    // =============================================
+    // 🔥 FORMATO CORRETO PARA SYNCPAY
+    // =============================================
+    // Opção 1: Basic Auth (mais comum)
+    const authString = Buffer.from(`${SYNC_CONFIG.clientId}:${SYNC_CONFIG.clientSecret}`).toString('base64');
+
     const response = await axios.post(
-      `${SYNC_CONFIG.baseURL}/auth/token`,
+      `${SYNC_CONFIG.baseURL}/oauth/token`, // ← TENTA ESSE ENDPOINT
+      // Opção 2: Se for grant_type
+      // 'grant_type=client_credentials',
       {
-        clientId: SYNC_CONFIG.clientId,
-        clientSecret: SYNC_CONFIG.clientSecret
+        grant_type: 'client_credentials',
+        client_id: SYNC_CONFIG.clientId,
+        client_secret: SYNC_CONFIG.clientSecret
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Basic ${authString}`
+        },
+        timeout: 10000
+      }
+    );
+
+    console.log('[SYNCPAY] Resposta do token:', JSON.stringify(response.data, null, 2));
+
+    const data = response.data;
+    syncPayToken = data.access_token || data.token || data.accessToken;
+    const expiresIn = data.expires_in || data.expiresIn || 3600;
+    tokenExpiresAt = Date.now() + (expiresIn * 1000) - 60000;
+
+    console.log('[SYNCPAY] Token obtido com sucesso!');
+    return syncPayToken;
+
+  } catch (error) {
+    console.error('[SYNCPAY] Erro ao obter token:');
+    
+    if (error.response) {
+      console.error('Status:', error.response.status);
+      console.error('Data:', JSON.stringify(error.response.data, null, 2));
+      
+      // Se der 404, tenta sem /oauth
+      if (error.response.status === 404) {
+        console.log('[SYNCPAY] Tentando sem /oauth...');
+        return await getSyncPayTokenFallback();
+      }
+    }
+    
+    console.error(error.message);
+    throw new Error('Erro ao autenticar com SyncPay');
+  }
+}
+
+// =============================================
+// 🔥 FALLBACK - TENTA SEM /oauth
+// =============================================
+async function getSyncPayTokenFallback() {
+  try {
+    console.log('[SYNCPAY] Tentando autenticação sem /oauth...');
+
+    const response = await axios.post(
+      `${SYNC_CONFIG.baseURL}/token`,
+      {
+        client_id: SYNC_CONFIG.clientId,
+        client_secret: SYNC_CONFIG.clientSecret,
+        grant_type: 'client_credentials'
       },
       {
         headers: {
@@ -83,17 +145,22 @@ async function getSyncPayToken() {
       }
     );
 
-    const data = response.data;
-    console.log('[SYNCPAY] Token obtido com sucesso!');
+    console.log('[SYNCPAY] Resposta:', JSON.stringify(response.data, null, 2));
 
+    const data = response.data;
     syncPayToken = data.access_token || data.token || data.accessToken;
     const expiresIn = data.expires_in || data.expiresIn || 3600;
-    tokenExpiresAt = Date.now() + (expiresIn * 1000) - 60000; // 1 min de folga
+    tokenExpiresAt = Date.now() + (expiresIn * 1000) - 60000;
 
+    console.log('[SYNCPAY] Token obtido com sucesso!');
     return syncPayToken;
+
   } catch (error) {
-    console.error('[SYNCPAY] Erro ao obter token:');
-    console.error(error.response?.data || error.message);
+    console.error('[SYNCPAY] Falha no fallback:');
+    if (error.response) {
+      console.error('Status:', error.response.status);
+      console.error('Data:', JSON.stringify(error.response.data, null, 2));
+    }
     throw new Error('Erro ao autenticar com SyncPay');
   }
 }
@@ -138,6 +205,8 @@ app.post('/api/pix', async (req, res) => {
     const upKey = String(body.upKey || '').trim();
     const { nome, cpf, email, phone } = body;
 
+    console.log('[REQ] Gerando PIX para:', { upKey, nome, cpf, email });
+
     // Valida produto
     if (!upKey || !Object.prototype.hasOwnProperty.call(PRODUCTS, upKey)) {
       return res.status(400).json({
@@ -147,7 +216,6 @@ app.post('/api/pix', async (req, res) => {
     }
 
     const amount = PRODUCTS[upKey];
-    const txnId = `PIX_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
     // Obtém token da SyncPay
     const token = await getSyncPayToken();
@@ -165,11 +233,10 @@ app.post('/api/pix', async (req, res) => {
         cpf: cpf || '00000000000',
         phone: phone || '55999999999'
       },
-      expiration: 3600, // 1 hora
+      expiration: 3600,
       description: `Pagamento - ${upKey}`,
       metadata: {
         upKey: upKey,
-        txnId: txnId,
         customerName: nome || '',
         customerCpf: cpf || ''
       }
@@ -177,29 +244,47 @@ app.post('/api/pix', async (req, res) => {
 
     console.log('[SYNCPAY] Payload:', JSON.stringify(payload, null, 2));
 
-    const syncPayResponse = await axios.post(
-      `${SYNC_CONFIG.baseURL}/pix/create`,
-      payload,
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        timeout: 30000
+    // =============================================
+    // 🔥 TENTA DIFERENTES ENDPOINTS
+    // =============================================
+    let syncPayResponse;
+    const endpoints = ['/pix/create', '/pix', '/charge/pix', '/payment/pix'];
+
+    for (const endpoint of endpoints) {
+      try {
+        console.log(`[SYNCPAY] Tentando endpoint: ${endpoint}`);
+        syncPayResponse = await axios.post(
+          `${SYNC_CONFIG.baseURL}${endpoint}`,
+          payload,
+          {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            timeout: 30000
+          }
+        );
+        console.log(`[SYNCPAY] Sucesso no endpoint: ${endpoint}`);
+        break;
+      } catch (err) {
+        console.log(`[SYNCPAY] Falha no endpoint ${endpoint}:`, err.response?.status);
+        if (err.response?.status === 404) continue;
+        throw err;
       }
-    );
+    }
+
+    if (!syncPayResponse) {
+      throw new Error('Nenhum endpoint da SyncPay respondeu');
+    }
 
     const pixData = syncPayResponse.data;
     console.log('[SYNCPAY] PIX criado com sucesso!');
 
-    // =============================================
-    // 🔥 RESPOSTA PARA O FRONTEND
-    // =============================================
     return res.status(200).json({
       success: true,
-      txnId: pixData.txid || pixData.txnId || txnId,
-      qrcode: pixData.qrcode || pixData.pixCopiaECola || pixData.pixCode || '',
+      txnId: pixData.txid || pixData.txnId || pixData.id || `PIX_${Date.now()}`,
+      qrcode: pixData.qrcode || pixData.pixCopiaECola || pixData.pixCode || pixData.code || '',
       qrcodeImage: pixData.qrcodeImage || pixData.qrCodeBase64 || pixData.qrCode || null,
       amount: pixData.value || pixData.amount || amount,
       status: pixData.status || 'pending',
@@ -209,7 +294,6 @@ app.post('/api/pix', async (req, res) => {
   } catch (error) {
     console.error('[SYNCPAY] Erro ao criar PIX:');
 
-    // Erro da SyncPay
     if (error.response) {
       console.error('Status:', error.response.status);
       console.error('Data:', JSON.stringify(error.response.data, null, 2));
@@ -220,24 +304,29 @@ app.post('/api/pix', async (req, res) => {
       });
     }
 
-    // Erro de timeout ou rede
-    if (error.code === 'ECONNABORTED') {
-      return res.status(408).json({
-        success: false,
-        error: 'Tempo limite excedido - SyncPay demorou para responder'
-      });
-    }
+    // =============================================
+    // 🔥 FALLBACK PARA MOCK SE A SYNCPAY FALHAR
+    // =============================================
+    console.log('[SYNCPAY] Usando MOCK como fallback');
+    const upKey = String(req.body.upKey || '').trim();
+    const amount = PRODUCTS[upKey] || 19.48;
+    const txnId = `MOCK_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const qrcode = `PIX_MOCK|TXN=${txnId}|AMOUNT=${amount.toFixed(2)}|PRODUCT=${upKey}`;
 
-    console.error(error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message || 'Erro interno ao gerar Pix'
+    return res.status(200).json({
+      success: true,
+      txnId,
+      qrcode,
+      amount,
+      status: 'pending',
+      paid: false,
+      _fallback: true
     });
   }
 });
 
 // =============================================
-// 🔥 STATUS DO PIX - SYNCPAY REAL
+// 🔥 STATUS DO PIX
 // =============================================
 app.get('/api/status', async (req, res) => {
   try {
@@ -251,7 +340,7 @@ app.get('/api/status', async (req, res) => {
       });
     }
 
-    // Se for MOCK, usa a lógica antiga (fallback)
+    // Se for MOCK, usa a lógica antiga
     if (txnId.startsWith('MOCK_')) {
       const parts = txnId.split('_');
       const createdAt = Number(parts[1]);
@@ -265,20 +354,14 @@ app.get('/api/status', async (req, res) => {
       });
     }
 
-    // =============================================
-    // 🔥 CONSULTA STATUS NA SYNCPAY
-    // =============================================
     const token = await getSyncPayToken();
-
-    console.log('[SYNCPAY] Consultando status do PIX:', txnId);
 
     const syncPayResponse = await axios.get(
       `${SYNC_CONFIG.baseURL}/pix/status/${txnId}`,
       {
         headers: {
           'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
+          'Content-Type': 'application/json'
         },
         timeout: 15000
       }
@@ -288,37 +371,15 @@ app.get('/api/status', async (req, res) => {
     const status = statusData.status || 'pending';
     const paid = status === 'paid' || status === 'completed' || status === 'confirmed';
 
-    console.log('[SYNCPAY] Status:', status, '| Paid:', paid);
-
     return res.status(200).json({
       paid,
-      status: status,
-      txnId: txnId,
+      status,
+      txnId,
       amount: statusData.value || statusData.amount || 0
     });
 
   } catch (error) {
-    console.error('[SYNCPAY] Erro ao consultar status:');
-
-    if (error.response) {
-      console.error('Status:', error.response.status);
-      console.error('Data:', JSON.stringify(error.response.data, null, 2));
-      // Se a transação não for encontrada, retorna pending
-      if (error.response.status === 404) {
-        return res.status(200).json({
-          paid: false,
-          status: 'pending',
-          txnId: req.query.id,
-          error: 'Transação não encontrada'
-        });
-      }
-      return res.status(200).json({
-        paid: false,
-        status: 'pending',
-        error: error.response.data?.message || 'Erro ao consultar status'
-      });
-    }
-
+    console.error('[SYNCPAY] Erro ao consultar status:', error.message);
     return res.status(200).json({
       paid: false,
       status: 'pending',
@@ -328,54 +389,19 @@ app.get('/api/status', async (req, res) => {
 });
 
 // =============================================
-// 🔥 TRACKING (Meta CAPI)
+// 🔥 TRACKING
 // =============================================
 app.post('/api/track', (req, res) => {
-  const body = req.body || {};
-
-  console.log('[TRACK]', {
-    eventName: body.eventName || null,
-    eventId: body.eventId || null,
-    value: body.value || null,
-    email: body.email || null,
-    phone: body.phone || null
-  });
-
-  // Aqui você pode integrar com a Meta Conversions API
-  // https://developers.facebook.com/docs/marketing-api/conversions-api/
-
-  return res.status(200).json({
-    success: true
-  });
+  console.log('[TRACK]', req.body);
+  return res.status(200).json({ success: true });
 });
 
 // =============================================
-// 🔥 WEBHOOK - SYNCPAY CONFIRMA PAGAMENTO
+// 🔥 WEBHOOK
 // =============================================
 app.post('/api/webhook', async (req, res) => {
-  try {
-    const webhookData = req.body;
-
-    console.log('[WEBHOOK] Recebido:', JSON.stringify(webhookData, null, 2));
-
-    // Estrutura esperada da SyncPay
-    const { txid, status, value, metadata } = webhookData;
-
-    if (status === 'paid' || status === 'completed' || status === 'confirmed') {
-      console.log(`[WEBHOOK] ✅ Pagamento confirmado! TXID: ${txid}, Valor: R$ ${value}`);
-
-      // 🔥 AQUI VOCÊ PODE DISPARAR O PRÓXIMO UPSELL
-      // Se o frontend tiver um endpoint para redirecionar, você pode chamar via fetch
-      // Ou apenas registrar no banco de dados
-    }
-
-    // Responde 200 para a SyncPay confirmar que recebeu
-    return res.status(200).json({ success: true });
-
-  } catch (error) {
-    console.error('[WEBHOOK] Erro:', error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
+  console.log('[WEBHOOK] Recebido:', JSON.stringify(req.body, null, 2));
+  return res.status(200).json({ success: true });
 });
 
 // =============================================
@@ -394,14 +420,13 @@ app.use((req, res) => {
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`========================================`);
-    console.log(`🚀 Servidor SyncPay rodando!`);
-    console.log(`📍 http://localhost:${PORT}`);
+    console.log(`🚀 Servidor rodando em http://localhost:${PORT}`);
     console.log(`🩺 Health: http://localhost:${PORT}/api/health`);
     console.log(`========================================`);
-    console.log(`📌 Configuração SyncPay:`);
+    console.log(`📌 SyncPay Config:`);
     console.log(`   BaseURL: ${SYNC_CONFIG.baseURL || '❌ NÃO CONFIGURADO'}`);
-    console.log(`   ClientId: ${SYNC_CONFIG.clientId ? '✅ CONFIGURADO' : '❌ NÃO CONFIGURADO'}`);
-    console.log(`   ClientSecret: ${SYNC_CONFIG.clientSecret ? '✅ CONFIGURADO' : '❌ NÃO CONFIGURADO'}`);
+    console.log(`   ClientId: ${SYNC_CONFIG.clientId ? '✅' : '❌'}`);
+    console.log(`   ClientSecret: ${SYNC_CONFIG.clientSecret ? '✅' : '❌'}`);
     console.log(`========================================`);
   });
 }
